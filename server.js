@@ -50,7 +50,7 @@ async function callGroq(messages, model = "llama-3.3-70b-versatile", apiKey = GR
   });
 }
 
-const PORT = 4000;
+const PORT = Number(process.env.PORT || 4000);
 const FRONTEND_ORIGIN = "http://localhost:8080";
 
 // NOTE: Remove seeded admin for security. Use proper authentication with password hashing.
@@ -144,29 +144,45 @@ function getAuthUser(req) {
   const auth = req.headers.authorization;
   if (!auth?.startsWith("Bearer ")) return null;
   const token = auth.slice(7).trim();
-  return accessTokens.get(token) ?? null;
+  return accessTokens.get(token)?.userId ?? null;
 }
 
 function createSession(userId) {
   const accessToken = randomUUID();
   const refreshToken = randomUUID();
-  accessTokens.set(accessToken, userId);
-  sessions.set(refreshToken, userId);
+  accessTokens.set(accessToken, { userId, refreshToken });
+  sessions.set(refreshToken, { userId, accessToken });
   return { accessToken, refreshToken };
+}
+
+function revokeSession(refreshToken) {
+  const session = sessions.get(refreshToken);
+  if (session?.accessToken) {
+    accessTokens.delete(session.accessToken);
+  }
+  sessions.delete(refreshToken);
+}
+
+function isOwnedByUser(item, userId) {
+  return item.userId === userId || item.user_id === userId;
+}
+
+function isPublicForm(form) {
+  return !!form && (form.isAnonymous === true || form.userId == null || form.user_id == null);
 }
 
 function filterBySince(items, since) {
   if (!since) return items;
   const date = new Date(since);
   if (Number.isNaN(date.getTime())) return items;
-  return items.filter((item) => new Date(item.createdAt || item.submittedAt || item.updatedAt) >= date);
+  return items.filter((item) => new Date(item.createdAt || item.created_at || item.submittedAt || item.submitted_at || item.updatedAt || item.updated_at) >= date);
 }
 
 function filterByFormIds(items, formIds) {
   if (!formIds) return items;
   const ids = formIds.split(",").map((id) => id.trim()).filter(Boolean);
   if (!ids.length) return items;
-  return items.filter((item) => ids.includes(item.formId));
+  return items.filter((item) => ids.includes(item.formId || item.form_id));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -177,9 +193,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const pathname = url.pathname;
+  let pathname = url.pathname;
   const search = url.searchParams;
   const method = req.method;
+
+  if (pathname.startsWith("/api/functions/") && method === "POST") {
+    const functionName = pathname.replace("/api/functions/", "");
+    pathname = `/api/ai/${functionName}`;
+  }
 
   if (pathname === "/api/auth/signup" && method === "POST") {
     const body = await parseJson(req);
@@ -215,48 +236,58 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/api/auth/logout" && method === "POST") {
     const body = await parseJson(req);
     if (body.refreshToken) {
-      sessions.delete(body.refreshToken);
+      revokeSession(body.refreshToken);
     }
     return sendJson(res, 200, { message: "Logged out" });
   }
 
   if (pathname === "/api/auth/refresh" && method === "POST") {
     const body = await parseJson(req);
-    const userId = sessions.get(body.refreshToken);
-    if (!userId) {
+    const existingSession = sessions.get(body.refreshToken);
+    if (!existingSession) {
       return sendJson(res, 401, { message: "Invalid refresh token" });
     }
-    const tokens = createSession(userId);
-    return sendJson(res, 200, { user: users.find((item) => item.id === userId), tokens });
+    revokeSession(body.refreshToken);
+    const tokens = createSession(existingSession.userId);
+    return sendJson(res, 200, { user: users.find((item) => item.id === existingSession.userId), tokens });
   }
 
   const userId = getAuthUser(req);
-  const requiresAuth = [
-    "/api/forms/count",
-    "/api/forms",
-    "/api/responses",
-    "/api/profiles",
-    "/api/complaints",
-  ];
+  const isFormDetailRead = pathname.startsWith("/api/forms/") && method === "GET";
+  const isFormViewIncrement = pathname.startsWith("/api/forms/") && pathname.endsWith("/increment-views") && method === "POST";
+  const isPublicResponseSubmit = pathname === "/api/responses" && method === "POST";
+  const isPublicResponseCount = pathname === "/api/responses" && method === "GET" && search.get("countOnly") === "true" && !!search.get("formId");
+  const requiresAuth =
+    pathname === "/api/forms/count" ||
+    (pathname === "/api/forms" && method !== "GET") ||
+    (pathname === "/api/forms" && method === "GET") ||
+    (pathname.startsWith("/api/forms/") && !isFormDetailRead && !isFormViewIncrement) ||
+    (pathname.startsWith("/api/responses") && !isPublicResponseSubmit && !isPublicResponseCount) ||
+    pathname.startsWith("/api/profiles") ||
+    (pathname.startsWith("/api/complaints") && method !== "POST");
 
-  if (requiresAuth.some((path) => pathname.startsWith(path)) && !userId) {
+  if (requiresAuth && !userId) {
     return sendJson(res, 401, { message: "Unauthorized" });
   }
 
   if (pathname === "/api/forms/count" && method === "GET") {
     const countUserId = search.get("userId");
     const since = search.get("since");
-    let items = forms;
-    if (countUserId) items = items.filter((form) => form.userId === countUserId || form.userId == null);
+    if (countUserId && countUserId !== userId) {
+      return sendJson(res, 403, { message: "Forbidden" });
+    }
+    let items = forms.filter((form) => isOwnedByUser(form, userId));
     items = filterBySince(items, since);
     return sendJson(res, 200, { count: items.length });
   }
 
   if (pathname === "/api/forms" && method === "GET") {
-    let items = forms;
+    let items = forms.filter((form) => isOwnedByUser(form, userId));
     const filterUserId = search.get("userId");
     const limit = Number(search.get("limit"));
-    if (filterUserId) items = items.filter((form) => form.userId === filterUserId || form.userId == null);
+    if (filterUserId && filterUserId !== userId) {
+      return sendJson(res, 403, { message: "Forbidden" });
+    }
     if (!Number.isNaN(limit) && limit > 0) items = items.slice(0, limit);
     return sendJson(res, 200, items);
   }
@@ -265,8 +296,7 @@ const server = http.createServer(async (req, res) => {
     const id = pathname.replace("/api/forms/", "");
     const form = forms.find((item) => item.id === id);
     if (!form) return sendJson(res, 404, { message: "Form not found" });
-    // Ownership check: users can only access their own forms or public forms
-    if (form.userId && form.userId !== userId) {
+    if (!isPublicForm(form) && !isOwnedByUser(form, userId)) {
       return sendJson(res, 403, { message: "Forbidden" });
     }
     return sendJson(res, 200, form);
@@ -280,7 +310,7 @@ const server = http.createServer(async (req, res) => {
       views: body.views ?? 0,
       createdAt: body.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      userId: userId || "user-1",
+      userId,
     };
     forms.push(form);
     return sendJson(res, 200, form);
@@ -290,6 +320,9 @@ const server = http.createServer(async (req, res) => {
     const body = await parseJson(req);
     const index = forms.findIndex((item) => item.id === body.id);
     if (index >= 0) {
+      if (!isOwnedByUser(forms[index], userId)) {
+        return sendJson(res, 403, { message: "Forbidden" });
+      }
       forms[index] = { ...forms[index], ...body, updatedAt: new Date().toISOString() };
       return sendJson(res, 200, forms[index]);
     }
@@ -299,7 +332,7 @@ const server = http.createServer(async (req, res) => {
       views: body.views ?? 0,
       createdAt: body.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      userId: userId || "user-1",
+      userId,
     };
     forms.push(form);
     return sendJson(res, 200, form);
@@ -319,7 +352,7 @@ const server = http.createServer(async (req, res) => {
     const form = forms.find((item) => item.id === id);
     if (!form) return sendJson(res, 404, { message: "Form not found" });
     // Ownership check
-    if (form.userId && form.userId !== userId) {
+    if (!isOwnedByUser(form, userId)) {
       return sendJson(res, 403, { message: "Forbidden" });
     }
     Object.assign(form, body, { updatedAt: new Date().toISOString() });
@@ -331,7 +364,7 @@ const server = http.createServer(async (req, res) => {
     const form = forms.find((item) => item.id === id);
     if (!form) return sendJson(res, 404, { message: "Form not found" });
     // Ownership check
-    if (form.userId && form.userId !== userId) {
+    if (!isOwnedByUser(form, userId)) {
       return sendJson(res, 403, { message: "Forbidden" });
     }
     const index = forms.findIndex((item) => item.id === id);
@@ -346,7 +379,16 @@ const server = http.createServer(async (req, res) => {
     const since = search.get("since");
     const countOnly = search.get("countOnly") === "true";
     const limit = Number(search.get("limit"));
-    if (formId) items = items.filter((item) => item.formId === formId);
+    if (!userId) {
+      const form = forms.find((item) => item.id === formId);
+      if (!countOnly || !isPublicForm(form)) {
+        return sendJson(res, 401, { message: "Unauthorized" });
+      }
+    } else {
+      const ownedFormIds = new Set(forms.filter((form) => isOwnedByUser(form, userId)).map((form) => form.id));
+      items = items.filter((item) => ownedFormIds.has(item.formId || item.form_id));
+    }
+    if (formId) items = items.filter((item) => (item.formId || item.form_id) === formId);
     if (formIds) items = filterByFormIds(items, formIds);
     items = filterBySince(items, since);
     if (!Number.isNaN(limit) && limit > 0) items = items.slice(0, limit);
@@ -359,8 +401,8 @@ const server = http.createServer(async (req, res) => {
     const responseItem = responses.find((item) => item.id === id);
     if (!responseItem) return sendJson(res, 404, { message: "Response not found" });
     // Ownership check via form ownership
-    const form = forms.find((f) => f.id === responseItem.formId);
-    if (form && form.userId && form.userId !== userId) {
+    const form = forms.find((f) => f.id === (responseItem.formId || responseItem.form_id));
+    if (!form || !isOwnedByUser(form, userId)) {
       return sendJson(res, 403, { message: "Forbidden" });
     }
     return sendJson(res, 200, responseItem);
@@ -382,8 +424,8 @@ const server = http.createServer(async (req, res) => {
     const responseItem = responses.find((item) => item.id === id);
     if (!responseItem) return sendJson(res, 404, { message: "Response not found" });
     // Ownership check via form ownership
-    const form = forms.find((f) => f.id === responseItem.formId);
-    if (form && form.userId && form.userId !== userId) {
+    const form = forms.find((f) => f.id === (responseItem.formId || responseItem.form_id));
+    if (!form || !isOwnedByUser(form, userId)) {
       return sendJson(res, 403, { message: "Forbidden" });
     }
     const index = responses.findIndex((item) => item.id === id);
@@ -454,6 +496,82 @@ const server = http.createServer(async (req, res) => {
     if (!complaint) return sendJson(res, 404, { message: "Complaint not found" });
     Object.assign(complaint, body);
     return sendJson(res, 200, complaint);
+  }
+
+  // ─── AI: GENERATE FORM ───────────────────────────────────────────────────
+  if (pathname === "/api/ai/generate-form" && method === "POST") {
+    const body = await parseJson(req);
+    const prompt = body.prompt || body.title || body.intent;
+    if (!prompt) return sendJson(res, 400, { message: "Missing prompt" });
+
+    const systemPrompt = `You are an expert form designer. Generate a professional form schema from the user's prompt.
+Return ONLY a JSON object:
+{
+  "title": "Form title",
+  "description": "Short form description",
+  "questions": [
+    {
+      "id": "uuid",
+      "title": "Question text",
+      "type": "short_text|long_text|email|number|phone|single_choice|multiple_choice|dropdown|date|time|rating|linear_scale|yes_no",
+      "required": true|false,
+      "description": "Optional helper text",
+      "options": [{"id": "uuid", "label": "Option label"}]
+    }
+  ]
+}
+Rules:
+- Use logical ordering
+- Include required fields where appropriate
+- Choose the best question type for each question
+- Keep questions clear and non-ambiguous`;
+
+    try {
+      const content = await callGroq([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Generate a form for: ${prompt}` },
+      ], "llama-3.3-70b-versatile", GROQ_API_KEY, true);
+
+      const parsed = JSON.parse(content);
+      if (parsed.questions) {
+        parsed.questions = parsed.questions.map((question) => ({
+          ...question,
+          id: question.id || randomUUID(),
+          options: question.options?.map((option) => ({ ...option, id: option.id || randomUUID() })),
+        }));
+      }
+      return sendJson(res, 200, parsed);
+    } catch (err) {
+      console.error("generate-form error:", err);
+      return sendJson(res, 500, { message: err.message || "AI form generation failed" });
+    }
+  }
+
+  // ─── AI: ANALYZE RESPONSES ───────────────────────────────────────────────
+  if (pathname === "/api/ai/analyze-responses" && method === "POST") {
+    const body = await parseJson(req);
+    const { form, responses: formResponses } = body;
+    if (!form || !Array.isArray(formResponses)) {
+      return sendJson(res, 400, { message: "Missing form or responses" });
+    }
+
+    const systemPrompt = `You are a research analyst. Summarize form responses, detect patterns, and highlight key insights.
+Return ONLY a JSON object:
+{
+  "content": "Concise markdown analysis with summary, patterns, and key insights"
+}`;
+
+    try {
+      const content = await callGroq([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Form:\n${JSON.stringify({ title: form.title, questions: form.questions }, null, 2)}\n\nResponses:\n${JSON.stringify(formResponses, null, 2)}` },
+      ], "llama-3.3-70b-versatile", GROQ_API_KEY, true);
+
+      return sendJson(res, 200, JSON.parse(content));
+    } catch (err) {
+      console.error("analyze-responses error:", err);
+      return sendJson(res, 500, { message: err.message || "AI response analysis failed" });
+    }
   }
 
   // ─── AI: SUGGEST NEXT QUESTION ───────────────────────────────────────────
@@ -817,11 +935,6 @@ Return ONLY a JSON object:
       return sendJson(res, 500, { message: err.message || "Translation failed" });
     }
   }
-// ─── ROUTE ALIAS FOR COMPATIBILITY ─────────────────────────────────────
-if (pathname.startsWith("/api/functions/") && method === "POST") {
-  const functionName = pathname.replace("/api/functions/", "");
-  req.url = `/api/ai/${functionName}`;
-}
   return sendJson(res, 404, { message: "Endpoint not found" });
 });
 

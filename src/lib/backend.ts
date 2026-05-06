@@ -29,6 +29,7 @@ const STORAGE_KEY = "aqora_auth_session";
 
 let currentSession: AppSession | null = loadSession();
 const authListeners = new Set<(event: AuthEvent, session: AppSession | null) => void>();
+let inFlightRefresh: Promise<boolean> | null = null;
 
 function loadSession(): AppSession | null {
   try {
@@ -124,39 +125,51 @@ async function refreshSession(): Promise<boolean> {
   const refreshToken = currentSession?.refresh_token;
   if (!refreshToken) return false;
 
-  const response = await rawRequest("/api/auth/refresh", {
-    method: "POST",
-    body: JSON.stringify({ refreshToken })
-  });
-
-  if (!response.ok) {
-    saveSession(null);
-    notifyAuth("SIGNED_OUT", null);
-    return false;
+  if (inFlightRefresh) {
+    return inFlightRefresh;
   }
 
-  const payload = await parseJsonSafe(response);
-  if (!payload?.tokens || !payload?.user) {
-    saveSession(null);
-    notifyAuth("SIGNED_OUT", null);
-    return false;
-  }
+  inFlightRefresh = (async () => {
+    try {
+      const response = await rawRequest("/api/auth/refresh", {
+        method: "POST",
+        body: JSON.stringify({ refreshToken })
+      });
 
-  const session: AppSession = {
-    access_token: payload.tokens.accessToken,
-    refresh_token: payload.tokens.refreshToken,
-    user: {
-      ...payload.user,
-      user_metadata: {
-        username: payload.user.username,
-        avatar_url: payload.user.avatar_url
+      if (!response.ok) {
+        saveSession(null);
+        notifyAuth("SIGNED_OUT", null);
+        return false;
       }
-    }
-  };
 
-  saveSession(session);
-  notifyAuth("TOKEN_REFRESHED", session);
-  return true;
+      const payload = await parseJsonSafe(response);
+      if (!payload?.tokens || !payload?.user) {
+        saveSession(null);
+        notifyAuth("SIGNED_OUT", null);
+        return false;
+      }
+
+      const session: AppSession = {
+        access_token: payload.tokens.accessToken,
+        refresh_token: payload.tokens.refreshToken,
+        user: {
+          ...payload.user,
+          user_metadata: {
+            username: payload.user.username,
+            avatar_url: payload.user.avatar_url
+          }
+        }
+      };
+
+      saveSession(session);
+      notifyAuth("TOKEN_REFRESHED", session);
+      return true;
+    } finally {
+      inFlightRefresh = null;
+    }
+  })();
+
+  return inFlightRefresh;
 }
 
 async function apiFetch(

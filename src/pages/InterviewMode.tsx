@@ -12,6 +12,7 @@ interface Message {
   type?: InterviewQuestion['type'];
   options?: { id: string; label: string }[];
   hint?: string;
+  isRetryPrompt?: boolean;
 }
 
 const INITIAL_QUESTIONS = [
@@ -59,7 +60,8 @@ const InterviewMode = () => {
     const value = selectedOption || currentInput.trim();
     if (!value || isLoading) return;
 
-    const currentQ = messages[messages.length - 1];
+    const currentQ = messages.filter(m => m.role === 'ai' && !m.isRetryPrompt).at(-1);
+    if (!currentQ) return;
     
     // Email validation for initial email question
     if (initStep === 1 && currentQ.type === 'email') {
@@ -116,13 +118,15 @@ const InterviewMode = () => {
         options: next.options,
         hint: next.hint,
       }]);
-    } catch (err: any) {
-      toast.error(err.message || "Failed to get next question");
-      // Add fallback AI message to prevent broken state
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to get next question";
+      toast.error(message);
+      setAnswers(answers);
       setMessages(prev => [...prev, {
         role: 'ai',
-        content: "Sorry, I encountered an error. Please try again.",
+        content: "Sorry, I couldn't save that answer. Please resend your answer.",
         type: 'short_text',
+        isRetryPrompt: true,
       }]);
     } finally {
       setIsLoading(false);
